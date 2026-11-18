@@ -1,0 +1,1563 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RAILWAY OBSTACLE DETECTION - ALL-IN-ONE DASHBOARD  (single file, version 4)
+
+SIMPLE LOGIC:  LiDAR reads <= STOP_CM  ->  motor OFF immediately  ->  camera names the object  ->  stays stopped
+               until LiDAR reads beyond STOP_CM + CLEAR_MARGIN_CM for 1 s, then you press Start again.
+               The camera NEVER stops the train. The ultrasonic sensor is display-only (USE_ULTRASONIC = False).
+Raspberry Pi 4 (2 GB) + TF-Luna LiDAR + HC-SR04 + Pi Camera (5 MP) + L298N + DC geared motor
+
+RUN:      python3 railwayproject2.py          then open  http://<pi-ip>:5000
+INSTALL:  sudo apt update
+          sudo apt install -y python3-flask python3-opencv python3-numpy python3-serial \
+                              python3-gpiozero python3-lgpio python3-picamera2
+          sudo raspi-config -> Interface Options -> Serial Port -> login shell: NO, serial hardware: YES -> reboot
+
+OPTIONAL YOLO (names animals: cow, giraffe, elephant, horse, dog, person ...). Download once:
+          cd ~/RailwayProject/models
+          wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg
+          wget https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4-tiny.weights
+
+HOW THE CAMERA LEARNS YOUR OBJECTS
+  Every folder inside  dataset/  is one class. The folder name is the label shown on the dashboard.
+  A folder whose name contains the word "clear" means "no obstacle".  Any other folder = an obstacle type.
+  Example:  dataset/clear_no_obstacle   dataset/cow   dataset/buffalo   dataset/giraffe_toy
+  Capture images with the dashboard, then press "Train from dataset".
+
+WIRING (physical pin numbers of the 40-pin header)
+  HC-SR04   VCC -> Pin 2 (5V)   GND -> Pin 6   TRIG -> Pin 16 (GPIO23)
+            ECHO -> voltage divider (1k + 2k) -> Pin 18 (GPIO24)
+  TF-Luna   VCC -> Pin 4 (5V)   GND -> Pin 14   TX -> Pin 10 (GPIO15 RXD)   RX -> Pin 8 (GPIO14 TXD)
+  L298N     ENA + ENB (both) -> Pin 12 (GPIO18)   IN1 -> Pin 29 (GPIO5)   IN3 -> Pin 31 (GPIO6)
+            IN2 and IN4 -> GND (important, do not leave them floating)   GND -> Pin 20 + battery minus
+  Pi Camera ribbon cable -> CSI camera port
+"""
+import os, sys, time, json, re, math, hmac, threading, subprocess, collections, random, datetime, atexit, select
+try:
+    import pty
+except ImportError:
+    pty = None
+import numpy as np
+import cv2
+from flask import Flask, Response, request, jsonify, abort, send_file
+
+try:
+    import serial
+except ImportError:
+    serial = None
+try:
+    from gpiozero import OutputDevice, InputDevice, DigitalOutputDevice, PWMOutputDevice
+    GPIO_OK = True
+except Exception:
+    GPIO_OK = False
+try:
+    from picamera2 import Picamera2
+except Exception:
+    Picamera2 = None
+
+# ============================ SETTINGS (edit here) ============================
+HOST, PORT = "0.0.0.0", 5000
+AUTH_USER, AUTH_PASS = "admin", "railway123"      # dashboard login. Set AUTH_PASS = None to disable
+SHUTDOWN_PASS = "1234"                            # password asked by the Shutdown button
+ROOT = os.path.expanduser("~/RailwayProject")     # project folder (created automatically)
+
+STOP_CM = 40.0              # LiDAR distance that stops the motor. Tune it so the train really halts ~20-25 cm from the obstacle
+CLEAR_MARGIN_CM = 5.0       # LiDAR must read beyond STOP_CM + this for 1 s before the track counts as clear
+USE_ULTRASONIC = False      # False = ultrasonic is only displayed. True = it can ALSO trigger the stop (backup for thin/side objects)
+STOP_ON_LIDAR_LOSS = True   # stop if LiDAR gives no valid reading while running (dead wire, blind zone, nothing in range)
+LIDAR_LOSS_SECONDS = 1.0    # how long the LiDAR may be blind before that safety stop
+IDENT_FRAMES = 4            # camera frames analysed after the stop to name the object
+
+LIDAR_PORT, LIDAR_BAUD = "/dev/serial0", 115200
+LIDAR_OFFSET_CM = 0.0       # distance from LiDAR to front of engine (TF-Luna blind zone is 0-20 cm!)
+US_TRIG, US_ECHO = 23, 24   # BCM numbers
+US_OFFSET_CM = 0.0
+
+MOTOR_PWM_PIN = 18          # ENA + ENB tied together (BCM) -> speed
+MOTOR_FWD_PINS = [5, 6]     # IN1, IN3 (BCM) -> HIGH = forward
+MOTOR_LOW_PINS = []         # IN2, IN4: wire them to GND (or list their GPIO numbers here)
+SPEED_MAX = 300             # speed scale 0-300. 300 = 100% motor power, 200 = 67% power
+START_PWM = 200             # speed at the moment the train starts
+DEFAULT_SPEED = 300         # constant speed reached after the ramp
+RAMP_SECONDS = 6.0          # time to go from START_PWM to the constant speed
+
+TRACK_CM, TRAIN_LEN_CM, TRAIN_WID_CM = 150, 33.5, 12.5
+FRAME_W, FRAME_H = 800, 600
+
+YOLO_SIZE = 320             # 320 = faster, 416 = more accurate
+YOLO_CONF = 0.35            # minimum YOLO confidence
+CLS_CONF = 0.60             # minimum confidence for the dataset classifier
+IGNORE_YOLO = {"train"}     # YOLO classes that must NOT count as obstacles
+# =============================================================================
+
+FOLDERS = ["dataset/clear_no_obstacle", "dataset/obstacle", "code", "models", "static", "logs", "detections"]
+for _f in FOLDERS:
+    os.makedirs(os.path.join(ROOT, _f), exist_ok=True)
+
+STARTER = '''# Railway Obstacle Detection - starter script
+# Reads live data from the dashboard, so it never fights over the GPIO pins.
+import json, time, base64, urllib.request
+
+URL = "http://localhost:5000/api/status"
+AUTH = "Basic " + base64.b64encode(b"__CRED__").decode()
+
+def get_status():
+    req = urllib.request.Request(URL, headers={"Authorization": AUTH})
+    return json.load(urllib.request.urlopen(req, timeout=2))
+
+while True:
+    s = get_status()
+    o = s["obstacle"]
+    print("state:", o["state"], "| object:", o["label"], "| distance:", o["distance"])
+    time.sleep(0.5)
+'''
+_sp = os.path.join(ROOT, "code", "obstacle_detection.py")
+if not os.path.exists(_sp):
+    with open(_sp, "w") as _fh:
+        _fh.write(STARTER.replace("__CRED__", "%s:%s" % (AUTH_USER, AUTH_PASS or "")))
+
+app = Flask(__name__)
+
+
+# ------------------------------ helpers -------------------------------------
+class Buf:
+    """Append-only text buffer that clients poll with an offset."""
+    def __init__(self):
+        self.t, self.base, self.lock = "", 0, threading.Lock()
+    def add(self, x):
+        with self.lock:
+            self.t += x
+            if len(self.t) > 200000:
+                cut = len(self.t) - 150000
+                self.t, self.base = self.t[cut:], self.base + cut
+    def get(self, since):
+        with self.lock:
+            since = max(since, self.base)
+            return self.t[since - self.base:], self.base + len(self.t)
+
+
+def safe(rel):
+    p = os.path.realpath(os.path.join(ROOT, (rel or "").lstrip("/")))
+    if p != os.path.realpath(ROOT) and not p.startswith(os.path.realpath(ROOT) + os.sep):
+        abort(403)
+    return p
+
+
+@app.before_request
+def _auth():
+    if not AUTH_PASS:
+        return
+    a = request.authorization
+    if not a or not hmac.compare_digest(a.username or "", AUTH_USER) or not hmac.compare_digest(a.password or "", AUTH_PASS):
+        return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Railway"'})
+
+
+# ------------------------------ sensors -------------------------------------
+ON_PI = os.path.exists("/proc/device-tree/model")
+LD = {"cm": None, "strength": 0, "temp": None, "t": 0.0}
+US = {"cm": None, "t": 0.0}
+LDIAG = {"msg": "starting...", "port": None, "baud": None, "bytes": 0, "frames": 0}
+UDIAG = {"msg": "starting...", "ok": 0, "fail": 0}
+SIM_L = SIM_U = False
+
+
+def sval(d, maxage=0.6):
+    return d["cm"] if (d["cm"] is not None and time.time() - d["t"] < maxage) else None
+
+
+def parse_frames(buf):
+    """Pull valid 9-byte TF-Luna frames out of buf (a bytearray, edited in place)."""
+    out = []
+    while len(buf) >= 9:
+        if buf[0] == 0x59 and buf[1] == 0x59 and (sum(buf[:8]) & 0xFF) == buf[8]:
+            out.append((buf[2] | (buf[3] << 8), buf[4] | (buf[5] << 8), (buf[6] | (buf[7] << 8)) / 8.0 - 256))
+            del buf[:9]
+        else:
+            del buf[0]
+    return out
+
+
+def open_lidar():
+    """Try the usual serial ports and baud rates until real TF-Luna frames show up."""
+    ports = []
+    for p in (LIDAR_PORT, "/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"):
+        if os.path.exists(p) and os.path.realpath(p) not in [os.path.realpath(x) for x in ports]:
+            ports.append(p)
+    if not ports:
+        LDIAG["msg"] = "No serial port. Run sudo raspi-config > Interface Options > Serial Port (login shell: No, hardware: Yes) and reboot"
+        return None
+    most, err = 0, None
+    for port in ports:
+        for baud in dict.fromkeys([LIDAR_BAUD, 115200, 9600, 57600, 38400, 19200]):
+            LDIAG["msg"] = "Scanning %s @ %d baud..." % (port, baud)
+            try:
+                ser = serial.Serial(port, baud, timeout=0.1)
+            except Exception as e:
+                err = "Cannot open %s: %s" % (port, e)
+                break
+            ser.reset_input_buffer()
+            buf, n, t0 = bytearray(), 0, time.time()
+            while time.time() - t0 < 0.6:
+                d = ser.read(64)
+                n += len(d)
+                buf += d
+            if parse_frames(buf):
+                LDIAG.update(port=port, baud=baud, msg="TF-Luna found")
+                return ser
+            ser.close()
+            most = max(most, n)
+    if most == 0:
+        LDIAG["msg"] = err or "Serial opens but 0 bytes received: check TF-Luna TX -> Pin 10, RX -> Pin 8, 5V power, and that serial login shell is disabled"
+    else:
+        LDIAG["msg"] = "Bytes received but no TF-Luna frames: wrong baud rate or serial console still enabled"
+    return None
+
+
+def lidar_thread():
+    while True:
+        ser = open_lidar()
+        if ser is None:
+            time.sleep(2)
+            continue
+        buf, last_ok = bytearray(), time.time()
+        while time.time() - last_ok < 4:
+            try:
+                d = ser.read(max(ser.in_waiting, 9))
+            except Exception as e:
+                LDIAG["msg"] = "Serial error: %s" % e
+                break
+            LDIAG["bytes"] += len(d)
+            buf += d
+            for dist, st, tmp in parse_frames(buf):
+                last_ok = time.time()
+                LDIAG["frames"] += 1
+                if st == 65535:
+                    LD["cm"], LDIAG["msg"] = None, "Signal saturated (target too close or too bright)"
+                elif dist <= 0 or st < 30:
+                    LD["cm"], LDIAG["msg"] = None, "No valid target (under 20 cm blind zone, nothing in range, or weak signal)"
+                else:
+                    LD.update(cm=round(dist - LIDAR_OFFSET_CM, 1), strength=st, temp=round(tmp, 1), t=time.time())
+                    LDIAG["msg"] = "OK"
+        try:
+            ser.close()
+        except Exception:
+            pass
+        LDIAG["msg"] = "Lost LiDAR data - rescanning..."
+        LD["cm"] = None
+
+
+def us_measure(trig, echo):
+    """One HC-SR04 reading. Returns (cm or None, reason)."""
+    trig.on()
+    time.sleep(0.00002)
+    trig.off()
+    t0 = time.perf_counter()
+    while not echo.value:
+        if time.perf_counter() - t0 > 0.03:
+            return None, "ECHO never went high: check TRIG/ECHO wires and 5V power"
+    ts = time.perf_counter()
+    while echo.value:
+        if time.perf_counter() - ts > 0.03:
+            return None, "ECHO stuck high: check the voltage divider / ECHO wire"
+    return (time.perf_counter() - ts) * 34300.0 / 2.0, ""
+
+
+def ultra_thread(trig, echo):
+    recent, fails = collections.deque(maxlen=3), 0
+    while True:
+        try:
+            d, why = us_measure(trig, echo)
+        except Exception as e:
+            d, why = None, "GPIO error: %s" % e
+        if d is not None and 2 <= d <= 400:
+            recent.append(d)
+            fails = 0
+            UDIAG["ok"] += 1
+            UDIAG["msg"] = "OK"
+            US.update(cm=round(float(np.median(recent)) - US_OFFSET_CM, 1), t=time.time())
+        else:
+            fails += 1
+            UDIAG["fail"] += 1
+            if fails >= 4:
+                US["cm"] = None
+                UDIAG["msg"] = why or "Out of range (under 2 cm or over 4 m)"
+        time.sleep(0.065)
+
+
+def sim_thread():
+    t0 = time.time()
+    while True:
+        base = 70 + 65 * math.sin((time.time() - t0) / 6.0)
+        if SIM_L:
+            LD.update(cm=round(max(base + random.uniform(-.4, .4), 3), 1), strength=800, temp=30.0, t=time.time())
+        if SIM_U:
+            US.update(cm=round(max(base + 2.5 + random.uniform(-.6, .6), 3), 1), t=time.time())
+        time.sleep(0.05)
+
+
+def start_sensors():
+    global SIM_L, SIM_U
+    if not ON_PI:
+        SIM_L = SIM_U = True
+        LDIAG["msg"] = UDIAG["msg"] = "simulated (not running on a Raspberry Pi)"
+        print("[SIMULATION] not on a Raspberry Pi - sensors are simulated")
+        threading.Thread(target=sim_thread, daemon=True).start()
+        return
+    if serial:
+        threading.Thread(target=lidar_thread, daemon=True).start()
+    else:
+        LDIAG["msg"] = "pyserial missing: sudo apt install python3-serial"
+    if GPIO_OK:
+        try:
+            trig, echo = OutputDevice(US_TRIG, initial_value=False), InputDevice(US_ECHO, pull_up=False)
+            threading.Thread(target=ultra_thread, args=(trig, echo), daemon=True).start()
+        except Exception as e:
+            UDIAG["msg"] = "GPIO error: %s" % e
+    else:
+        UDIAG["msg"] = "gpiozero missing: sudo apt install python3-gpiozero python3-lgpio"
+
+
+def lidar_note():
+    if SIM_L:
+        return "simulated"
+    if sval(LD) is not None:
+        return "%s @ %s baud - signal %d%s" % (LDIAG["port"], LDIAG["baud"], LD["strength"], " (weak)" if LD["strength"] < 100 else "")
+    return LDIAG["msg"]
+
+
+def ultra_note():
+    if SIM_U:
+        return "simulated"
+    if sval(US) is not None:
+        return "TRIG GPIO%d / ECHO GPIO%d - OK%s" % (US_TRIG, US_ECHO, "" if USE_ULTRASONIC else " (display only)")
+    return UDIAG["msg"]
+
+
+# ------------------------------ camera --------------------------------------
+class Camera:
+    def __init__(self):
+        self.lock, self.jpg, self.frame, self.id, self.kind = threading.Lock(), None, None, 0, "none"
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        grab, cam = None, None
+        if Picamera2:
+            try:
+                cam = Picamera2()
+                cam.configure(cam.create_video_configuration(main={"size": (FRAME_W, FRAME_H), "format": "RGB888"}))
+                cam.start()
+                grab, self.kind = cam.capture_array, "Pi Camera"
+            except Exception as e:
+                print("[Camera] picamera2 failed: %s" % e)
+        if grab is None:
+            try:
+                cap = cv2.VideoCapture(0)
+                if cap.isOpened():
+                    grab, self.kind = (lambda: cap.read()[1]), "USB/OpenCV"
+            except Exception:
+                pass
+        while True:
+            try:
+                if grab:
+                    fr = grab()
+                else:
+                    fr = np.zeros((FRAME_H, FRAME_W, 3), np.uint8) + 25
+                    cv2.putText(fr, "NO CAMERA FOUND", (190, FRAME_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (80, 80, 255), 3)
+                    time.sleep(0.1)
+                if fr is None:
+                    time.sleep(0.05)
+                    continue
+                if fr.ndim == 3 and fr.shape[2] == 4:
+                    fr = fr[:, :, :3]
+                ok, enc = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                with self.lock:
+                    self.frame, self.jpg, self.id = fr, enc.tobytes(), self.id + 1
+            except Exception as e:
+                print("[Camera] error: %s" % e)
+                time.sleep(0.5)
+
+    def get_jpg(self):
+        with self.lock:
+            return self.jpg, self.id
+
+    def get_frame(self):
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+
+
+COCO = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+        "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+        "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+        "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+        "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+        "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+        "scissors", "teddy bear", "hair drier", "toothbrush"]
+
+
+def pretty(name):
+    return name.replace("_", " ").replace("-", " ").strip().title()
+
+
+def is_clear_name(name):
+    return "clear" in name.lower()
+
+
+def make_hog():
+    return cv2.HOGDescriptor((128, 96), (16, 16), (8, 8), (8, 8), 9)
+
+
+class Detector:
+    """
+    Camera brain. Two parts work together:
+      1) YOLOv4-tiny (if its files are in models/)  -> names animals/people/objects (cow, giraffe, ...)
+      2) Dataset classifier (trained from dataset/)  -> learns YOUR objects and YOUR clear track
+    """
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.yolo, self.yolo_out = None, None
+        self.feats, self.labels, self.names, self.counts = None, None, [], {}
+        self.hog = make_hog()
+        self.training, self.msg = False, ""
+        self.npz = os.path.join(ROOT, "models", "classifier.npz")
+        cfg = os.path.join(ROOT, "models", "yolov4-tiny.cfg")
+        wts = os.path.join(ROOT, "models", "yolov4-tiny.weights")
+        if os.path.exists(cfg) and os.path.exists(wts):
+            try:
+                self.yolo = cv2.dnn.readNetFromDarknet(cfg, wts)
+                self.yolo.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                self.yolo.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                self.yolo_out = self.yolo.getUnconnectedOutLayersNames()
+                print("[Detector] YOLOv4-tiny loaded")
+            except Exception as e:
+                self.yolo = None
+                print("[Detector] YOLO load failed: %s" % e)
+        else:
+            print("[Detector] YOLO files not found in models/ (dataset classifier only)")
+        self.load()
+
+    # ---- dataset classifier ----
+    def feat(self, f, hog):
+        img = cv2.resize(f, (128, 96))
+        h = hog.compute(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).flatten().astype(np.float32)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        c = cv2.calcHist([hsv], [0, 1, 2], None, [8, 4, 4], [0, 180, 0, 256, 0, 256]).flatten().astype(np.float32)
+        h /= (np.linalg.norm(h) + 1e-6)
+        c /= (np.linalg.norm(c) + 1e-6)
+        v = np.concatenate([h, c])
+        return v / (np.linalg.norm(v) + 1e-6)
+
+    def load(self):
+        if not os.path.exists(self.npz):
+            return
+        try:
+            z = np.load(self.npz, allow_pickle=False)
+            names = [str(x) for x in z["names"]]
+            counts = json.loads(str(z["counts"]))
+            with self.lock:
+                self.feats, self.labels, self.names, self.counts = z["feats"], z["labels"], names, counts
+            print("[Detector] dataset model loaded: %s" % counts)
+        except Exception as e:
+            print("[Detector] dataset model load failed: %s" % e)
+
+    def train(self):
+        if self.training:
+            return
+        self.training, self.msg = True, "Training: reading images..."
+        try:
+            base = os.path.join(ROOT, "dataset")
+            hog = make_hog()
+            X, y, names, counts = [], [], [], {}
+            for name in sorted(os.listdir(base)):
+                d = os.path.join(base, name)
+                if not os.path.isdir(d):
+                    continue
+                files = [x for x in sorted(os.listdir(d)) if x.lower().endswith((".jpg", ".jpeg", ".png"))]
+                n = 0
+                idx = len(names)
+                for fn in files:
+                    img = cv2.imread(os.path.join(d, fn))
+                    if img is None:
+                        continue
+                    X.append(self.feat(img, hog)); y.append(idx)
+                    X.append(self.feat(cv2.flip(img, 1), hog)); y.append(idx)
+                    n += 1
+                    self.msg = "Training: %s (%d images)..." % (name, n)
+                if n:
+                    names.append(name)
+                    counts[name] = n
+            if not any(is_clear_name(n) for n in names):
+                self.msg = "Cannot train: put images in a folder whose name contains 'clear' (e.g. clear_no_obstacle)"
+                return
+            if not any(not is_clear_name(n) for n in names):
+                self.msg = "Cannot train: add at least one obstacle folder with images (e.g. obstacle, cow)"
+                return
+            X, y = np.array(X, np.float32), np.array(y, np.int32)
+            np.savez(self.npz, feats=X, labels=y, names=np.array(names), counts=np.array(json.dumps(counts)))
+            with self.lock:
+                self.feats, self.labels, self.names, self.counts = X, y, names, counts
+            self.msg = "Training finished: " + ", ".join("%s %d" % (k, v) for k, v in counts.items())
+            print("[Detector] " + self.msg)
+        except Exception as e:
+            self.msg = "Training failed: %s" % e
+            print("[Detector] " + self.msg)
+        finally:
+            self.training = False
+
+    def classify(self, f):
+        v = self.feat(f, self.hog)
+        sims = self.feats @ v
+        k = min(7, len(sims))
+        top = np.argsort(-sims)[:k]
+        votes = {}
+        for i in top:
+            lab = int(self.labels[i])
+            votes[lab] = votes.get(lab, 0.0) + float(max(sims[i], 0.0)) ** 6
+        best = max(votes, key=votes.get)
+        return self.names[best], votes[best] / (sum(votes.values()) + 1e-9)
+
+    # ---- YOLO ----
+    def run_yolo(self, f):
+        h, w = f.shape[:2]
+        blob = cv2.dnn.blobFromImage(f, 1 / 255.0, (YOLO_SIZE, YOLO_SIZE), swapRB=True, crop=False)
+        self.yolo.setInput(blob)
+        outs = self.yolo.forward(self.yolo_out)
+        boxes, confs, ids = [], [], []
+        for o in outs:
+            for row in o:
+                sc = row[5:]
+                cid = int(np.argmax(sc))
+                cf = float(row[4] * sc[cid])
+                if cf < YOLO_CONF or cid >= len(COCO):
+                    continue
+                bw, bh = row[2] * w, row[3] * h
+                boxes.append([int(row[0] * w - bw / 2), int(row[1] * h - bh / 2), int(bw), int(bh)])
+                confs.append(cf)
+                ids.append(cid)
+        best = None
+        if boxes:
+            keep = cv2.dnn.NMSBoxes(boxes, confs, YOLO_CONF, 0.45)
+            for i in np.array(keep).flatten():
+                name = COCO[ids[i]]
+                if name in IGNORE_YOLO:
+                    continue
+                x, y, bw, bh = boxes[i]
+                cx, bottom = (x + bw / 2) / w, (y + bh) / h
+                if 0.1 < cx < 0.9 and bottom > 0.35 and bw * bh > 0.01 * w * h:
+                    score = confs[i] * bw * bh
+                    if best is None or score > best[0]:
+                        best = (score, pretty(name), confs[i], (max(x, 0) / w, max(y, 0) / h, min(x + bw, w) / w, min(y + bh, h) / h))
+        return best[1:] if best else None
+
+    def ready(self):
+        return self.yolo is not None or self.feats is not None
+
+    def detect(self, f):
+        """Returns dict(found, label, conf, source, box, ready)."""
+        with self.lock:
+            res = {"found": False, "label": None, "conf": 0.0, "source": None, "box": None, "ready": self.ready()}
+            cname, cconf = (None, 0.0)
+            if self.feats is not None:
+                cname, cconf = self.classify(f)
+            yb = self.run_yolo(f) if self.yolo is not None else None
+            if cname is not None and not is_clear_name(cname) and cconf >= CLS_CONF:
+                label, src = pretty(cname), "Dataset"
+                if label.lower() == "obstacle" and yb:      # generic folder -> use YOLO's specific name
+                    label, src = yb[0], "YOLO"
+                res.update(found=True, label=label, conf=round(cconf, 2), source=src, box=yb[2] if yb and src == "YOLO" else None)
+            elif yb:
+                res.update(found=True, label=yb[0], conf=round(yb[1], 2), source="YOLO", box=yb[2])
+            return res
+
+    def info(self):
+        parts = ["YOLO: " + ("ready" if self.yolo is not None else "not installed")]
+        parts.append("Dataset model: " + (", ".join("%s %d" % (k, v) for k, v in self.counts.items()) if self.feats is not None else "not trained yet"))
+        txt = " | ".join(parts)
+        if self.msg:
+            txt += " | " + self.msg
+        return {"yolo": self.yolo is not None, "classifier": self.feats is not None, "training": self.training,
+                "classes": self.names, "text": txt}
+
+
+camera, detector = Camera(), Detector()
+
+# ------------------------------ obstacle logic ------------------------------
+OBS = {"state": "clear", "label": None, "distance": None, "nearest": None, "t0": 0.0, "snap": None, "snap_id": 0,
+       "source": None, "conf": 0.0}
+
+
+def annotate(fr, text, box=None, color=(60, 60, 255)):
+    img = cv2.resize(fr, (480, int(480 * fr.shape[0] / fr.shape[1])))
+    ih, iw = img.shape[:2]
+    if box:
+        cv2.rectangle(img, (int(box[0] * iw), int(box[1] * ih)), (int(box[2] * iw), int(box[3] * ih)), color, 2)
+    if text:
+        cv2.putText(img, text[:36], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    return img
+
+
+def set_snapshot(fr, text, box=None):
+    if fr is None:
+        return
+    img = annotate(fr, text, box)
+    ok, enc = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    OBS["snap"], OBS["snap_id"] = enc.tobytes(), OBS["snap_id"] + 1
+    try:
+        name = datetime.datetime.now().strftime("obstacle_%Y%m%d_%H%M%S.jpg")
+        cv2.imwrite(os.path.join(ROOT, "detections", name), fr)
+    except Exception:
+        pass
+
+
+def identify(dist):
+    """Runs AFTER the train has stopped: the camera looks at the obstacle and names it."""
+    votes, lastfr = {}, None
+    for _ in range(IDENT_FRAMES):
+        fr = camera.get_frame()
+        if fr is None:
+            time.sleep(0.2)
+            continue
+        lastfr = fr
+        try:
+            r = detector.detect(fr)
+        except Exception as e:
+            print("[Identify] error: %s" % e)
+            continue
+        if r["found"]:
+            v = votes.setdefault(r["label"], {"n": 0, "conf": 0.0, "src": r["source"], "box": r["box"]})
+            v["n"] += 1
+            if r["conf"] >= v["conf"]:
+                v.update(conf=r["conf"], src=r["source"], box=r["box"])
+        time.sleep(0.1)
+    dtxt = "%.1f cm" % dist if dist is not None else ""
+    if votes:
+        label = max(votes, key=lambda k: (votes[k]["n"], votes[k]["conf"]))
+        v = votes[label]
+        OBS.update(label=label, conf=v["conf"])
+        set_snapshot(lastfr, "%s %s" % (label, dtxt), v["box"])
+    else:
+        OBS.update(label=None, conf=0.0)
+        set_snapshot(lastfr, "Unknown object %s" % dtxt)
+    OBS["state"] = "stopped"
+
+
+def monitor():
+    """LiDAR (or ultrasonic if enabled) <= STOP_CM -> motor off at once -> camera names the object."""
+    hits, clear_t, lost_t = 0, None, None
+    while True:
+        time.sleep(0.05)
+        now = time.time()
+        lv = sval(LD)
+        uv = sval(US) if USE_ULTRASONIC else None
+        vals = [v for v in (lv, uv) if v is not None]
+        near = min(vals) if vals else None
+        OBS["nearest"] = near
+        hit = near is not None and near <= STOP_CM
+
+        if OBS["state"] == "clear":
+            # safety: LiDAR blind while the train is moving
+            if STOP_ON_LIDAR_LOSS and train.running and lv is None:
+                lost_t = lost_t or now
+                if now - lost_t > LIDAR_LOSS_SECONDS:
+                    train.stop("LiDAR has no valid reading - stopped for safety", braked=True)
+                    lost_t = None
+            else:
+                lost_t = None
+            hits = hits + 1 if hit else 0
+            if hits >= 2:
+                src = []
+                if lv is not None and lv <= STOP_CM:
+                    src.append("LiDAR")
+                if uv is not None and uv <= STOP_CM:
+                    src.append("Ultrasonic")
+                train.stop("Obstacle at %.1f cm (%s)" % (near, " + ".join(src)), braked=True)   # 1) MOTOR OFF FIRST
+                OBS.update(state="identifying", t0=now, label=None, conf=0.0, distance=near, source=" + ".join(src))
+                threading.Thread(target=identify, args=(near,), daemon=True).start()           # 2) THEN name it
+                clear_t, hits = None, 0
+        else:
+            if near is not None:
+                OBS["distance"] = near
+            # clear only when a REAL reading says it is far (no reading = still blocked)
+            if near is not None and near > STOP_CM + CLEAR_MARGIN_CM:
+                if clear_t is None:
+                    clear_t = now
+                elif now - clear_t > 1.0 and OBS["state"] == "stopped":
+                    OBS.update(state="clear", label=None, source=None, conf=0.0)
+                    hits = 0
+            else:
+                clear_t = None
+
+
+# ------------------------------ train / motor -------------------------------
+class Train:
+    def __init__(self):
+        self.running, self.braked, self.reason = False, False, ""
+        self.target, self.cur, self.t_start = DEFAULT_SPEED, 0, 0.0
+        self.fwd, self.low, self.pwm = [], [], None
+        if GPIO_OK and ON_PI:
+            try:
+                self.fwd = [DigitalOutputDevice(p) for p in MOTOR_FWD_PINS]
+                self.low = [DigitalOutputDevice(p) for p in MOTOR_LOW_PINS]
+                self.pwm = PWMOutputDevice(MOTOR_PWM_PIN, frequency=1000)
+            except Exception as e:
+                print("[Motor] cannot start: %s (motor simulated)" % e)
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def _apply(self, v):
+        if not self.pwm:
+            return
+        for d in self.low:
+            d.off()
+        if v <= 0:
+            for d in self.fwd:
+                d.off()
+            self.pwm.value = 0
+        else:
+            for d in self.fwd:
+                d.on()
+            self.pwm.value = min(1.0, v / float(SPEED_MAX))
+
+    def start(self):
+        if OBS["state"] != "clear":
+            return False, "Obstacle ahead - clear the track first"
+        near = OBS["nearest"]
+        if near is not None and near <= STOP_CM:
+            return False, "Obstacle within %g cm - clear the track first" % STOP_CM
+        if STOP_ON_LIDAR_LOSS and sval(LD) is None:
+            return False, "LiDAR has no valid reading - check the sensor (object closer than 20 cm, or wiring)"
+        self.braked, self.reason, self.running, self.t_start = False, "", True, time.time()
+        self.cur = min(START_PWM, self.target)
+        return True, "started"
+
+    def stop(self, reason="Stopped", braked=False):
+        self.running, self.cur, self.braked, self.reason = False, 0, braked, reason
+        self._apply(0)
+
+    def ramping(self):
+        return self.running and (time.time() - self.t_start < RAMP_SECONDS or self.cur != self.target)
+
+    def loop(self):
+        while True:
+            if self.running:
+                frac = min(1.0, (time.time() - self.t_start) / RAMP_SECONDS)
+                want = self.target if self.target <= START_PWM else START_PWM + (self.target - START_PWM) * frac
+                self.cur = int(round(self.cur + max(-6, min(6, want - self.cur))))
+                self._apply(self.cur)
+            time.sleep(0.05)
+
+
+train = Train()
+atexit.register(lambda: train.stop("exit"))
+
+# ------------------------------ run / terminal ------------------------------
+RUN = {"p": None, "buf": Buf()}
+TERM = {"p": None, "fd": None, "buf": Buf()}
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x07|\x1b[=>]")
+
+
+def run_reader(p, buf):
+    while True:
+        try:
+            d = os.read(p.stdout.fileno(), 4096)
+        except Exception:
+            break
+        if not d:
+            break
+        buf.add(d.decode("utf-8", "replace"))
+    buf.add("\n[process finished, exit code %s]\n" % p.wait())
+
+
+def term_start():
+    if not pty:
+        TERM["buf"].add("Terminal needs Linux/Raspberry Pi OS.\n")
+        return
+    master, slave = pty.openpty()
+    env = dict(os.environ, TERM="dumb", PS1=r"\u@\h:\w\$ ")
+    p = subprocess.Popen(["bash", "--noprofile", "--norc", "-i"], stdin=slave, stdout=slave, stderr=slave,
+                         cwd=ROOT, env=env, preexec_fn=os.setsid, close_fds=True)
+    os.close(slave)
+    TERM["p"], TERM["fd"] = p, master
+
+    def rd():
+        while True:
+            r, _, _ = select.select([master], [], [], 0.5)
+            if r:
+                try:
+                    d = os.read(master, 4096)
+                except OSError:
+                    break
+                if not d:
+                    break
+                TERM["buf"].add(ANSI.sub("", d.decode("utf-8", "replace")).replace("\r\n", "\n").replace("\r", ""))
+            elif p.poll() is not None:
+                break
+        TERM["buf"].add("\n[shell closed - type something to restart]\n")
+    threading.Thread(target=rd, daemon=True).start()
+
+
+def term_ensure():
+    if TERM["p"] is None or TERM["p"].poll() is not None:
+        term_start()
+
+
+# ------------------------------ API -----------------------------------------
+_temp = {"v": None, "t": 0}
+
+
+def cpu_temp():
+    if time.time() - _temp["t"] > 5:
+        _temp["t"] = time.time()
+        try:
+            _temp["v"] = round(int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000.0, 1)
+        except Exception:
+            _temp["v"] = None
+    return _temp["v"]
+
+
+def snapshot():
+    now = time.time()
+    near = OBS["nearest"]
+    dist = OBS["distance"] if OBS["state"] != "clear" else near
+    return {
+        "t": now, "sim": SIM_L or SIM_U,
+        "lidar": {"cm": sval(LD), "ok": sval(LD) is not None, "strength": LD["strength"], "sim": SIM_L, "note": lidar_note()},
+        "ultra": {"cm": sval(US), "ok": sval(US) is not None, "sim": SIM_U, "note": ultra_note()},
+        "obstacle": {"state": OBS["state"], "label": OBS["label"], "distance": dist, "snap_id": OBS["snap_id"],
+                     "source": OBS["source"], "conf": OBS["conf"]},
+        "train": {"running": train.running, "ramping": train.ramping(), "cur": train.cur, "target": train.target,
+                  "braked": train.braked, "reason": train.reason},
+        "pi": {"temp": cpu_temp(), "camera": camera.kind},
+        "model": detector.info(),
+        "cfg": {"stop_cm": STOP_CM, "use_ultra": USE_ULTRASONIC, "speed_max": SPEED_MAX},
+    }
+
+
+@app.route("/")
+def index():
+    return Response(HTML.replace("__ROOT__", ROOT).replace("__TRACK__", "%g cm track - engine %g x %g cm" % (TRACK_CM, TRAIN_LEN_CM, TRAIN_WID_CM))
+                    .replace("__SMIN__", str(START_PWM)).replace("__SMAX__", str(SPEED_MAX)).replace("__SDEF__", str(DEFAULT_SPEED)),
+                    mimetype="text/html")
+
+
+@app.route("/stream")
+def stream():
+    def gen():
+        while True:
+            yield "data: " + json.dumps(snapshot()) + "\n\n"
+            time.sleep(0.15)
+    return Response(gen(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/status")
+def api_status():
+    return jsonify(snapshot())
+
+
+@app.route("/video_feed")
+def video_feed():
+    def gen():
+        last = -1
+        while True:
+            jpg, fid = camera.get_jpg()
+            if jpg and fid != last:
+                last = fid
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+                time.sleep(0.04)
+            else:
+                time.sleep(0.02)
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/obstacle.jpg")
+def obstacle_jpg():
+    if not OBS["snap"]:
+        abort(404)
+    return Response(OBS["snap"], mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.route("/api/datasets")
+def api_datasets():
+    d = os.path.join(ROOT, "dataset")
+    return jsonify(sorted(n for n in os.listdir(d) if os.path.isdir(os.path.join(d, n))))
+
+
+@app.route("/api/capture", methods=["POST"])
+def api_capture():
+    name = re.sub(r"[^A-Za-z0-9_\-]", "_", (request.json or {}).get("folder", "") or "")
+    if not name:
+        return jsonify(ok=False, error="Choose a folder"), 400
+    fr = camera.get_frame()
+    if fr is None:
+        return jsonify(ok=False, error="Camera not ready"), 503
+    folder = os.path.join(ROOT, "dataset", name)
+    os.makedirs(folder, exist_ok=True)
+    fn = "%s_%s.jpg" % (name, datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3])
+    cv2.imwrite(os.path.join(folder, fn), fr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    sees = "model not ready (train it first)"
+    try:
+        r = detector.detect(fr)
+        if r["ready"]:
+            sees = ("%s (%d%%, %s)" % (r["label"], int(r["conf"] * 100), r["source"])) if r["found"] else "clear track"
+    except Exception as e:
+        sees = "error: %s" % e
+    return jsonify(ok=True, file="dataset/%s/%s" % (name, fn), sees=sees,
+                   count=len([x for x in os.listdir(folder) if x.lower().endswith(".jpg")]))
+
+
+@app.route("/api/model/train", methods=["POST"])
+def api_model_train():
+    if detector.training:
+        return jsonify(ok=False, error="Already training")
+    threading.Thread(target=detector.train, daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.route("/api/model/status")
+def api_model_status():
+    return jsonify(detector.info())
+
+
+def tree(path, depth=0):
+    out = []
+    try:
+        names = [n for n in os.listdir(path) if not n.startswith(".") and n != "__pycache__"]
+    except OSError:
+        return out
+    names.sort(key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
+    for n in names[:80]:
+        fp = os.path.join(path, n)
+        rel = os.path.relpath(fp, ROOT)
+        if os.path.isdir(fp):
+            out.append({"name": n, "path": rel, "type": "dir", "children": tree(fp, depth + 1) if depth < 6 else []})
+        else:
+            out.append({"name": n, "path": rel, "type": "file"})
+    if len(names) > 80:
+        out.append({"name": "... %d more" % (len(names) - 80), "type": "more"})
+    return out
+
+
+@app.route("/api/tree")
+def api_tree():
+    return jsonify(root=ROOT, children=tree(ROOT))
+
+
+@app.route("/api/file", methods=["GET", "POST"])
+def api_file():
+    if request.method == "GET":
+        p = safe(request.args.get("path"))
+        if not os.path.isfile(p):
+            return jsonify(error="File not found"), 404
+        if os.path.getsize(p) > 1_000_000:
+            return jsonify(error="File too large to edit"), 400
+        try:
+            return jsonify(content=open(p, encoding="utf-8").read())
+        except UnicodeDecodeError:
+            return jsonify(error="Binary file - cannot edit"), 400
+    j = request.json or {}
+    p = safe(j.get("path"))
+    if os.path.isdir(p):
+        return jsonify(error="That is a folder"), 400
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(j.get("content", ""))
+    return jsonify(ok=True)
+
+
+@app.route("/api/raw")
+def api_raw():
+    p = safe(request.args.get("path"))
+    if not os.path.isfile(p):
+        abort(404)
+    return send_file(p)
+
+
+@app.route("/api/create", methods=["POST"])
+def api_create():
+    j = request.json or {}
+    p = safe(j.get("path"))
+    if os.path.exists(p):
+        return jsonify(error="Already exists"), 400
+    if j.get("type") == "dir":
+        os.makedirs(p)
+    else:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").close()
+    return jsonify(ok=True)
+
+
+@app.route("/api/train/<act>", methods=["POST"])
+def api_train(act):
+    j = request.json or {}
+    if "speed" in j:
+        train.target = max(0, min(SPEED_MAX, int(j["speed"])))
+    if act == "start":
+        ok, msg = train.start()
+        return jsonify(ok=ok, msg=msg)
+    if act == "stop":
+        train.stop("Stopped by user")
+    return jsonify(ok=True)
+
+
+@app.route("/api/run", methods=["POST"])
+def api_run():
+    j = request.json or {}
+    p = safe(j.get("path"))
+    if not os.path.isfile(p):
+        return jsonify(error="Open a file first"), 400
+    old = RUN["p"]
+    if old and old.poll() is None:
+        old.kill()
+    args = [sys.executable, "-u"] + (["-m", "pdb"] if j.get("debug") else []) + [p]
+    RUN["buf"].add("\n>>> %s%s\n" % ("DEBUG (pdb): " if j.get("debug") else "Run: ", os.path.relpath(p, ROOT)))
+    RUN["p"] = subprocess.Popen(args, cwd=os.path.dirname(p), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, bufsize=0)
+    threading.Thread(target=run_reader, args=(RUN["p"], RUN["buf"]), daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.route("/api/run/stop", methods=["POST"])
+def api_run_stop():
+    if RUN["p"] and RUN["p"].poll() is None:
+        RUN["p"].kill()
+    return jsonify(ok=True)
+
+
+@app.route("/api/run/input", methods=["POST"])
+def api_run_input():
+    p = RUN["p"]
+    if p and p.poll() is None:
+        try:
+            p.stdin.write(((request.json or {}).get("text", "") + "\n").encode())
+            p.stdin.flush()
+        except Exception:
+            pass
+    return jsonify(ok=True)
+
+
+@app.route("/api/run/output")
+def api_run_output():
+    text, nxt = RUN["buf"].get(int(request.args.get("since", 0)))
+    return jsonify(text=text, next=nxt, running=bool(RUN["p"] and RUN["p"].poll() is None))
+
+
+@app.route("/api/term/output")
+def api_term_output():
+    term_ensure()
+    text, nxt = TERM["buf"].get(int(request.args.get("since", 0)))
+    return jsonify(text=text, next=nxt)
+
+
+@app.route("/api/term/input", methods=["POST"])
+def api_term_input():
+    term_ensure()
+    if TERM["fd"] is not None:
+        os.write(TERM["fd"], (request.json or {}).get("data", "").encode())
+    return jsonify(ok=True)
+
+
+CHECK = {"snap": None, "id": 0, "hist": collections.deque(maxlen=8)}
+
+
+@app.route("/api/check", methods=["GET", "POST"])
+def api_check():
+    """Obstacle check using ONLY the camera (YOLO + dataset model)."""
+    if request.method == "GET":
+        return jsonify(list(CHECK["hist"]))
+    fr = camera.get_frame()
+    if fr is None:
+        return jsonify(time=datetime.datetime.now().strftime("%H:%M:%S"), level="error", verdict="CAMERA NOT READY",
+                       camera="no frame", label=None, conf=0, source=None, snap_id=CHECK["id"])
+    r = detector.detect(fr)
+    if not r["ready"]:
+        level, verdict = "error", "CAMERA AI NOT READY - capture dataset and press Train, or install YOLO"
+    elif r["found"]:
+        level, verdict = "danger", "OBSTACLE: %s (%d%%)" % (r["label"].upper(), int(r["conf"] * 100))
+    else:
+        level, verdict = "ok", "TRACK CLEAR - camera sees no obstacle"
+    color = {"danger": (60, 60, 255), "ok": (120, 230, 90)}.get(level, (200, 200, 200))
+    img = annotate(fr, verdict, r["box"], color)
+    CHECK["snap"], CHECK["id"] = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes(), CHECK["id"] + 1
+    res = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "level": level, "verdict": verdict,
+           "camera": "object seen" if r["found"] else ("nothing seen" if r["ready"] else "no model"),
+           "label": r["label"], "conf": r["conf"], "source": r["source"], "snap_id": CHECK["id"]}
+    CHECK["hist"].append(res)
+    try:
+        with open(os.path.join(ROOT, "logs", "obstacle_checks.log"), "a") as fh:
+            fh.write(datetime.datetime.now().isoformat(timespec="seconds") + " " + json.dumps(res) + "\n")
+    except Exception:
+        pass
+    return jsonify(res)
+
+
+@app.route("/check.jpg")
+def check_jpg():
+    if not CHECK["snap"]:
+        abort(404)
+    return Response(CHECK["snap"], mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+def _poweroff_now():
+    time.sleep(0.3)                      # lets the HTTP reply reach the browser first
+    for cmd in (["shutdown", "-h", "now"] if os.geteuid() == 0 else ["sudo", "-n", "shutdown", "-h", "now"],
+                ["sudo", "-n", "systemctl", "poweroff"],
+                ["sudo", "-n", "poweroff"]):
+        try:
+            if subprocess.call(cmd) == 0:
+                return
+        except Exception:
+            pass
+
+
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    pw = str((request.json or {}).get("password", ""))
+    if not hmac.compare_digest(pw.encode(), SHUTDOWN_PASS.encode()):
+        return jsonify(ok=False, error="Wrong password"), 403
+    if os.name != "posix":
+        return jsonify(ok=False, error="Shutdown only works on the Raspberry Pi")
+    if os.geteuid() != 0 and subprocess.call(["sudo", "-n", "true"], stderr=subprocess.DEVNULL) != 0:
+        return jsonify(ok=False, error="No permission: add a NOPASSWD sudo rule for shutdown")
+    train.stop("Shutdown")               # motor off first
+    threading.Thread(target=_poweroff_now, daemon=True).start()
+    return jsonify(ok=True)
+
+
+# ------------------------------ web page ------------------------------------
+HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Railway Obstacle Detection</title>
+<style>
+:root{--bg:#0a101c;--panel:#0e1729;--line:#1d2b47;--txt:#e9efff;--mut:#9db0d3;--blue:#1769ff;--green:#2ee684;--red:#ff3b3b;--amber:#ffb020;--yel:#ffe01a}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--txt);font-family:"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+button,select,input,textarea{font:inherit;color:inherit}
+header{display:flex;align-items:center;gap:18px;height:86px;padding:0 24px 0 22px;background:#0b1322;border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:30px;letter-spacing:.5px;font-weight:700}
+header .sub{font-size:20px;color:#c9d6f2;margin-top:2px}
+.sp{flex:1}
+.pi{display:flex;align-items:center;gap:12px;font-weight:600;line-height:1.35}.pi span{color:var(--mut);font-weight:400}
+.conn{display:flex;align-items:center;gap:8px;color:var(--green);font-size:19px}
+.conn i,.badge i{width:11px;height:11px;border-radius:50%;background:currentColor;display:inline-block}
+.conn.off{color:var(--red)}
+.shut{display:flex;align-items:center;gap:10px;border:0;background:#d62b34;color:#fff;font-weight:700;font-size:19px;padding:15px 24px;border-radius:7px;cursor:pointer}
+.shut:hover{background:#ee3640}
+.app{display:grid;grid-template-columns:186px 1fr;min-height:calc(100vh - 86px)}
+nav{background:#0b1322;border-right:1px solid var(--line);padding:10px 0}
+nav a{display:flex;align-items:center;gap:14px;padding:14px 16px;margin:2px 0;font-size:17px;color:#dbe5fb;cursor:pointer;text-decoration:none;line-height:1.3}
+nav a.on{background:var(--blue);color:#fff;font-weight:600;border-radius:0 6px 6px 0;margin-right:8px}
+nav a:hover:not(.on){background:#12203a}
+main{padding:12px 14px 24px;display:flex;flex-direction:column;gap:14px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:10px 12px;position:relative;min-width:0}
+.card.flash{box-shadow:0 0 0 2px var(--blue)}
+h2{margin:0 0 8px;font-size:22px;font-weight:600;display:flex;align-items:center;gap:10px}
+.top{display:grid;grid-template-columns:1.75fr 1fr 1fr;grid-template-areas:"cam lidar ultra" "cam alert alert";gap:14px}
+.video{position:relative;aspect-ratio:16/10;background:#000;border-radius:5px;overflow:hidden}
+.video img{width:100%;height:100%;object-fit:cover;display:block}
+.live{position:absolute;right:10px;top:10px;background:#1c7a3c;color:#eaffee;border-radius:6px;padding:5px 12px;font-size:16px;display:flex;align-items:center;gap:7px}
+.live i{width:9px;height:9px;border-radius:50%;background:#fff}
+.capbar{display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:9px;border:0;border-radius:6px;padding:12px 18px;font-size:17px;font-weight:600;cursor:pointer;background:#1b2a47}
+.btn.blue{background:var(--blue);color:#fff}.btn.blue:hover{background:#2f7bff}
+.btn.sm{padding:6px 12px;font-size:14px}.btn.grn{background:#1f8a47}.btn.red{background:#a82a30}.btn:disabled{opacity:.45;cursor:default}
+select{background:#0a1324;border:1px solid var(--line);border-radius:6px;padding:11px 12px;font-size:17px;min-width:190px}
+.msg{color:var(--green);font-size:14px}
+.sensor{min-height:172px;display:flex;flex-direction:column}
+.sensor.lidar{background:linear-gradient(135deg,#0c2431,#0b3a36);border-color:#16515a}
+.sensor.ultra{background:linear-gradient(135deg,#0c1d3e,#0a2d5a);border-color:#1b3f7a}
+.sensor h2{font-size:22px;color:#f3f7ff}.sensor h2 svg{color:#3b8cff}
+.sensor .val{flex:1;display:flex;align-items:center;justify-content:center;font-size:58px;font-weight:700;color:var(--green);padding-top:14px}
+.sensor .val small{font-size:58px;margin-left:12px;font-weight:700}
+.badge{position:absolute;right:16px;top:64px;color:var(--green);font-size:17px;display:flex;align-items:center;gap:6px}
+.badge.off{color:var(--red)}
+.alert{grid-area:alert;transition:background .2s,border-color .2s}
+.alert h2{font-size:23px;font-weight:600;margin-bottom:12px}
+.alert.clear{background:#0c2418;border-color:#1c6b43}.alert.clear h2{color:var(--green)}
+.alert.warn{background:#2a2108;border-color:#a67a14}.alert.warn h2{color:var(--amber)}
+.alert.danger{background:linear-gradient(135deg,#2a0c12,#220a0e);border:2px solid #c3262d}.alert.danger h2{color:#ff5d4f}
+.abody{display:flex;gap:20px;align-items:center}
+.thumb{width:280px;height:194px;border-radius:5px;overflow:hidden;background:#000;flex:none}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.alert.clear .thumb{display:none}
+.okbig{display:none;width:120px;height:120px;border-radius:50%;border:4px solid var(--green);color:var(--green);align-items:center;justify-content:center;flex:none;margin:6px 10px}
+.alert.clear .okbig{display:flex}
+.info .lbl{font-size:21px;color:#dbe6ff;margin-top:6px}
+.info .obj{font-size:31px;font-weight:700;color:var(--yel)}
+.alert.clear .info .obj{color:var(--green)}
+.info .dist{font-size:46px;font-weight:700;color:#ff4040;line-height:1.15}
+.alert.clear .info .dist{color:var(--green)}.alert.warn .info .dist{color:var(--amber)}
+.anote{font-size:14px;color:var(--mut);margin-top:6px}
+.bot{display:grid;grid-template-columns:1.85fr 1fr 1.5fr;gap:14px;align-items:stretch}
+.speedrow{display:flex;align-items:flex-end;gap:20px;border-top:1px solid var(--line);padding-top:14px;margin-top:2px}
+.speedrow .l{flex:1;font-size:19px}
+input[type=range]{width:100%;height:8px;margin:18px 0 10px;accent-color:var(--blue);cursor:pointer}
+.hint{color:var(--mut);font-size:17px}
+.curbox{text-align:left}.curbox .t{font-size:19px;font-weight:600;margin-bottom:6px}
+.curbox .n{border:2px solid #1f9e55;border-radius:7px;padding:8px 18px;font-size:26px;font-weight:700;color:var(--green);background:#0d2a1d;text-align:center}
+.tbtn{width:100%;margin-top:14px;padding:17px;font-size:22px;font-weight:700;border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:14px;border:2px solid #25a257;background:#1c6a35;color:#fff}
+.tbtn.idle{background:var(--blue);border-color:#4b8dff}
+.tbtn.ramp{background:#7a5a10;border-color:var(--amber)}
+.tbtn.brk{background:#7a1c22;border-color:#ff5a5a}
+.tmsg{min-height:20px;margin-top:8px;font-size:14px;color:var(--mut)}
+.snote{font-size:13px;color:#a9bbd9;text-align:center;padding:0 8px 2px;min-height:18px}
+.chk{display:flex;gap:18px;align-items:stretch;flex-wrap:wrap}
+.chkL{display:flex;flex-direction:column;gap:10px;min-width:250px;max-width:300px}
+.chkL .btn{justify-content:center}.btn.big{font-size:20px;padding:16px 22px}
+.chkR{flex:1;min-width:320px;border:1px solid var(--line);border-radius:8px;padding:12px 16px;background:#0a1324}
+.chkR.ok{background:#0c2418;border-color:#1c6b43}.chkR.warn{background:#2a2108;border-color:#a67a14}
+.chkR.danger{background:#2a0c12;border-color:#c3262d}.chkR.error{background:#1d1d26;border-color:#6b6b80}
+.chkV{font-size:23px;font-weight:700}
+.chkR.ok .chkV{color:var(--green)}.chkR.warn .chkV{color:var(--amber)}.chkR.danger .chkV{color:#ff5d4f}
+.chkG{display:flex;gap:30px;flex-wrap:wrap;margin-top:12px;font-size:16px;color:#c9d6f2}
+.chkG b{display:block;font-size:26px;color:#fff;margin-top:2px}
+.chkH{font-size:13px;color:#b9c8e6;line-height:1.6;max-height:130px;overflow:auto}
+#tree{max-height:222px;overflow:auto;font-size:17px;margin-top:6px}
+#tree ul{list-style:none;margin:0;padding-left:20px}#tree>ul{padding-left:0}
+.trow{display:flex;align-items:center;gap:7px;padding:4px 4px;border-radius:4px;cursor:pointer;white-space:nowrap}
+.trow:hover{background:#15233f}.trow.sel{background:#16305c}
+.trow .car{width:12px;color:var(--mut);font-size:12px}
+.trow.more{color:var(--mut);cursor:default;font-style:italic}
+.path{color:#cfdcf7;font-size:18px;margin:2px 0 4px;word-break:break-all}
+.tabs{display:flex;gap:4px;margin-bottom:6px}
+.tab{border:0;background:#0b1424;border-radius:6px 6px 0 0;padding:10px 20px;font-size:18px;cursor:pointer;color:#dbe5fb}
+.tab.on{background:var(--blue);color:#fff;font-weight:600}
+.pane{display:none;flex-direction:column;gap:6px}
+.ebar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.fname{color:var(--mut);font-size:14px;margin-right:auto;word-break:break-all}
+.ed{position:relative;display:flex;height:190px;background:#0a1220;border:1px solid var(--line);border-radius:5px;overflow:hidden;font:14px/21px "DejaVu Sans Mono",Consolas,Menlo,monospace}
+.gut{width:40px;flex:none;overflow:hidden;color:#6f82a8;text-align:right;padding:8px 8px 20px 0;border-right:1px solid var(--line);white-space:pre;user-select:none}
+.code{position:relative;flex:1;min-width:0}
+.code pre,.code textarea{position:absolute;inset:0;margin:0;padding:8px 10px 20px;font:inherit;tab-size:4;white-space:pre;overflow:auto;border:0;outline:0;background:transparent;resize:none;letter-spacing:0}
+.code pre{pointer-events:none;overflow:hidden;color:#dbe6ff}
+.code textarea{color:transparent;caret-color:#fff}
+.k{color:#ff6b7a}.s{color:#9be37a}.c{color:#6f8fc0;font-style:italic}.n{color:#ffb86b}.f{color:#6bc1ff}
+.out{height:104px;margin:0;background:#080f1c;border:1px solid var(--line);border-radius:5px;padding:7px 10px;overflow:auto;font:13px/18px "DejaVu Sans Mono",Consolas,monospace;white-space:pre-wrap;word-break:break-all;color:#cfe0ff}
+.term{height:250px}
+.irow{display:flex;gap:6px;align-items:center}
+.irow input{flex:1;background:#080f1c;border:1px solid var(--line);border-radius:5px;padding:8px 10px;font:14px "DejaVu Sans Mono",Consolas,monospace;outline:0;min-width:0}
+.irow input:focus{border-color:var(--blue)}
+.toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#16305c;border:1px solid #2f66c2;padding:11px 20px;border-radius:8px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:30}
+.toast.on{opacity:1}
+.modal{position:fixed;inset:0;background:#000b;display:none;align-items:center;justify-content:center;z-index:40}
+.modal.on{display:flex}
+.modal .box{background:#101a30;border:1px solid var(--line);border-radius:10px;padding:26px 30px;max-width:420px;text-align:center}
+.modal .box p{color:var(--mut)}.modal .row{display:flex;gap:12px;justify-content:center;margin-top:18px}
+.modal input{width:100%;margin-top:6px;background:#080f1c;border:1px solid var(--line);border-radius:6px;padding:12px;font-size:20px;text-align:center;letter-spacing:6px;outline:0}
+.modal input:focus{border-color:var(--blue)}
+.modal .err{color:#ff6b6b;min-height:22px;margin-top:8px;font-size:15px}
+@media(max-width:1150px){.top{grid-template-columns:1fr 1fr;grid-template-areas:"cam cam" "lidar ultra" "alert alert"}.bot{grid-template-columns:1fr}.app{grid-template-columns:70px 1fr}nav a span{display:none}header h1{font-size:22px}header .sub{font-size:15px}.pi{display:none}}
+@media(max-width:700px){.abody{flex-direction:column;align-items:flex-start}.thumb{width:100%}.sensor .val,.sensor .val small{font-size:40px}}
+</style></head><body>
+
+<header>
+ <svg width="132" height="66" viewBox="0 0 132 66"><rect x="6" y="26" width="108" height="24" rx="4" fill="#f5c400"/><rect x="14" y="10" width="38" height="18" rx="3" fill="#f5c400"/><rect x="20" y="14" width="8" height="8" fill="#123"/><rect x="34" y="14" width="8" height="8" fill="#123"/><rect x="60" y="16" width="30" height="10" rx="2" fill="#c99a00"/><rect x="96" y="20" width="18" height="8" rx="2" fill="#c99a00"/><rect x="6" y="40" width="108" height="5" fill="#b02a1a"/><circle cx="28" cy="54" r="7" fill="#e8e8e8"/><circle cx="52" cy="54" r="7" fill="#e8e8e8"/><circle cx="92" cy="54" r="7" fill="#e8e8e8"/><path d="M0 62h132" stroke="#8aa0c8" stroke-width="3"/></svg>
+ <div><h1>RAILWAY OBSTACLE DETECTION</h1><div class="sub">Smart Railway Safety System</div></div>
+ <div class="sp"></div>
+ <div class="pi"><svg width="52" height="56" viewBox="0 0 52 56"><path d="M26 12C18 2 8 6 8 6c4 6 10 8 18 6zM26 12c8-10 18-6 18-6-4 6-10 8-18 6z" fill="#3fae49"/><g fill="#d6234b"><circle cx="26" cy="22" r="7"/><circle cx="14" cy="28" r="7"/><circle cx="38" cy="28" r="7"/><circle cx="20" cy="39" r="7"/><circle cx="32" cy="39" r="7"/><circle cx="26" cy="48" r="6"/></g></svg>
+  <div><div id="piName">Raspberry Pi 4</div><span>(2 GB RAM)</span></div></div>
+ <div class="conn off" id="conn"><i></i><span id="connTxt">Connecting...</span></div>
+ <button class="shut" id="btnShut"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v9"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/></svg>Shutdown</button>
+</header>
+
+<div class="app">
+<nav id="nav">
+ <a class="on" data-go="top"><svg width="26" height="26" viewBox="0 0 24 24" fill="#fff"><path d="M12 3 2 12h3v8h5v-6h4v6h5v-8h3z"/></svg><span>Overview</span></a>
+ <a data-go="secCam"><svg width="26" height="26" viewBox="0 0 24 24" fill="#dbe5fb"><path d="M9 4 7.5 6H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-3.5L15 4zm3 4.5a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9z"/></svg><span>Camera &amp; Dataset</span></a>
+ <a data-go="secFiles"><svg width="26" height="26" viewBox="0 0 24 24" fill="#9fc3ff"><path d="M2 5a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/></svg><span>Project Files</span></a>
+ <a data-go="secSensors"><svg width="26" height="26" viewBox="0 0 24 24" fill="#dbe5fb"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg><span>Sensors</span></a>
+ <a data-go="secCheck"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#dbe5fb" stroke-width="2.4" stroke-linecap="round"><circle cx="10.500" cy="10.500" r="6.500"/><path d="m16 16 5 5"/></svg><span>Obstacle Check</span></a>
+ <a data-go="secTrain"><svg width="26" height="26" viewBox="0 0 24 24" fill="#dbe5fb"><path d="M6 2h12a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3l2 3h-2.5l-1.5-2h-8L6.500 21H4l2-3a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3zm0 3v5h12V5zm2.500 8.500a1.500 1.500 0 1 0 0 3 1.500 1.500 0 0 0 0-3zm7 0a1.500 1.500 0 1 0 0 3 1.500 1.500 0 0 0 0-3z"/></svg><span>Train Control</span></a>
+ <a data-go="secEditor" data-tab="editor"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#dbe5fb" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>Code Editor</span></a>
+ <a data-go="secEditor" data-tab="terminal"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#dbe5fb" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6 7 6-7 6M13 19h8"/></svg><span>Terminal</span></a>
+</nav>
+
+<main id="top">
+ <div class="top">
+  <section class="card" id="secCam" style="grid-area:cam">
+   <h2><svg width="34" height="34" viewBox="0 0 24 24" fill="#fff"><path d="M3 6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v3l5-3v12l-5-3v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Live Camera Feed</h2>
+   <div class="video"><img id="video" alt="camera" src="/video_feed"><span class="live"><i></i>Live</span></div>
+   <div class="capbar">
+    <button class="btn blue" id="capBtn"><svg width="26" height="26" viewBox="0 0 24 24" fill="#fff"><path d="M9 4 7.500 6H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-3.500L15 4zm3 4.500a4.500 4.500 0 1 1 0 9 4.500 4.500 0 0 1 0-9z"/></svg>Capture Image</button>
+    <label for="saveTo" style="font-size:18px">Save to:</label>
+    <select id="saveTo"></select>
+    <button class="btn grn" id="trainModelBtn">Train from dataset</button>
+   </div>
+   <div class="msg" id="capMsg" style="margin-top:8px"></div>
+   <div class="hint" id="modelMsg" style="font-size:14px;margin-top:4px"></div>
+  </section>
+
+  <section class="card sensor lidar" id="secSensors" style="grid-area:lidar">
+   <h2><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="2" fill="currentColor"/><path d="M8.500 8.500a5 5 0 0 0 0 7M15.500 8.500a5 5 0 0 1 0 7M5.600 5.600a9 9 0 0 0 0 12.800M18.400 5.600a9 9 0 0 1 0 12.800"/></svg>TF-Luna LiDAR</h2>
+   <span class="badge off" id="lidarBadge"><i></i><b>No data</b></span>
+   <div class="val"><span id="lidarVal">--</span><small>cm</small></div><div class="snote" id="lidarNote"></div>
+  </section>
+  <section class="card sensor ultra" style="grid-area:ultra">
+   <h2><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="2" fill="currentColor"/><path d="M8.500 8.500a5 5 0 0 0 0 7M15.500 8.500a5 5 0 0 1 0 7M5.600 5.600a9 9 0 0 0 0 12.800M18.400 5.600a9 9 0 0 1 0 12.800"/></svg>HC-SR04 Ultrasonic</h2>
+   <span class="badge off" id="ultraBadge"><i></i><b>No data</b></span>
+   <div class="val"><span id="ultraVal">--</span><small>cm</small></div><div class="snote" id="ultraNote"></div>
+  </section>
+
+  <section class="card alert clear" id="alert">
+   <h2><svg width="38" height="38" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 1 21h22zm-1 7h2v6h-2zm0 8h2v2h-2z"/></svg><span id="aTitle">TRACK CLEAR</span></h2>
+   <div class="abody">
+    <div class="thumb"><img id="aImg" alt="" onerror="this.style.visibility='hidden'" onload="this.style.visibility='visible'"></div>
+    <div class="okbig"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.600" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.500 4.500 4.500L19 7"/></svg></div>
+    <div class="info"><div class="lbl">Detected Object:</div><div class="obj" id="aObj">None</div>
+     <div class="lbl" style="margin-top:10px">Distance:</div><div class="dist" id="aDist">-- cm</div></div>
+   </div>
+   <div class="anote" id="aNote"></div>
+  </section>
+ </div>
+
+ <section class="card" id="secCheck">
+  <h2><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#cfe0ff" stroke-width="2.400" stroke-linecap="round"><circle cx="10.500" cy="10.500" r="6.500"/><path d="m16 16 5 5"/></svg>Obstacle Check (camera only)</h2>
+  <div class="chk">
+   <div class="chkL"><button class="btn blue big" id="chkBtn">Run Obstacle Check</button>
+    <div class="hint" style="font-size:14px">Uses only the camera: YOLO (animals, people, objects) plus your trained dataset. The camera never stops the train; the LiDAR does, and then the camera names the object.</div></div>
+   <div class="chkR" id="chkR"><div class="chkV" id="chkV">Press &ldquo;Run Obstacle Check&rdquo; to look at the track now.</div><div class="chkG" id="chkG"></div></div>
+   <div class="thumb" id="chkT" style="width:230px;height:160px;display:none"><img id="chkImg" alt=""></div>
+   <div style="min-width:230px;flex:1"><div class="hint" style="font-size:14px;margin-bottom:4px">Recent checks</div><div id="chkH" class="chkH"></div></div>
+  </div>
+ </section>
+
+ <div class="bot">
+  <section class="card" id="secTrain">
+   <h2><svg width="34" height="34" viewBox="0 0 24 24" fill="#dbe5fb"><path d="M6 2h12a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3l2 3h-2.500l-1.500-2h-8L6.500 21H4l2-3a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3zm0 3v5h12V5zm2.500 8.500a1.500 1.500 0 1 0 0 3 1.500 1.500 0 0 0 0-3zm7 0a1.500 1.500 0 1 0 0 3 1.500 1.500 0 0 0 0-3z"/></svg>Train Control (Forward Only)</h2>
+   <div class="speedrow">
+    <div class="l"><div>Speed Control:</div>
+     <input type="range" id="speed" min="__SMIN__" max="__SMAX__" value="__SDEF__">
+     <div class="hint">Starts at __SMIN__ &rarr; up to <span id="tgt"></span> (max __SMAX__)</div></div>
+    <div class="curbox"><div class="t">Current Speed:</div><div class="n" id="curSpeed">0 / __SMAX__</div></div>
+   </div>
+   <button class="tbtn idle" id="trainBtn"></button>
+   <div class="tmsg" id="trainMsg">__TRACK__</div>
+  </section>
+
+  <section class="card" id="secFiles">
+   <h2 style="justify-content:space-between"><span style="display:flex;gap:10px;align-items:center"><svg width="32" height="32" viewBox="0 0 24 24" fill="#cfe0ff"><path d="M2 5a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/></svg>Project Workspace</span></h2>
+   <div class="path" id="rootPath">__ROOT__/</div>
+   <div style="display:flex;gap:6px;margin-bottom:4px"><button class="btn sm" id="newFile">+ File</button><button class="btn sm" id="newDir">+ Folder</button><button class="btn sm" id="refresh">Refresh</button></div>
+   <div id="tree"></div>
+  </section>
+
+  <section class="card" id="secEditor">
+   <div class="tabs"><button class="tab on" id="tab-editor">Code Editor (Thonny)</button><button class="tab" id="tab-terminal">Terminal</button></div>
+   <div class="pane" id="pane-editor" style="display:flex">
+    <div class="ebar"><span class="fname" id="fname">No file open - click a file in Project Workspace</span>
+     <button class="btn sm" id="bSave">Save</button><button class="btn sm grn" id="bRun">&#9654; Run</button><button class="btn sm" id="bDbg">Debug</button><button class="btn sm red" id="bStop" disabled>&#9632; Stop</button></div>
+    <div class="ed"><div class="gut" id="gut">1</div><div class="code"><pre id="hl"></pre><textarea id="ta" spellcheck="false" wrap="off"></textarea></div></div>
+    <pre class="out" id="shell">Shell: program output appears here.
+</pre>
+    <div class="irow"><input id="shellIn" placeholder="Type input for the running program / pdb command, press Enter"></div>
+   </div>
+   <div class="pane" id="pane-terminal">
+    <pre class="out term" id="termOut"></pre>
+    <div class="irow"><input id="termIn" placeholder="Type a command, press Enter (e.g. ls, pip list, python3 file.py)" autocomplete="off"><button class="btn sm" id="tInt">Ctrl+C</button><button class="btn sm" id="tClr">Clear</button></div>
+   </div>
+  </section>
+ </div>
+</main></div>
+
+<div class="toast" id="toast"></div>
+<div class="modal" id="modal"><div class="box"><h2 style="justify-content:center">Shut down the Raspberry Pi?</h2><p>The train will stop and the dashboard will go offline. Enter the password to confirm.</p>
+ <input type="password" id="shPass" inputmode="numeric" placeholder="Password" autocomplete="off">
+ <div class="err" id="shErr"></div>
+ <div class="row"><button class="btn" id="mNo">Cancel</button><button class="btn red" id="mYes">Shut down</button></div></div></div>
+
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const J=(url,body)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json().catch(()=>({})));
+function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2600)}
+
+/* ---------- realtime stream ---------- */
+let lastT=null, snapId=-1, sliderBusy=false, firstSync=true;
+function setSensor(id,d){$('#'+id+'Note').textContent=d.note||'';const b=$('#'+id+'Badge');$('#'+id+'Val').textContent=d.ok?d.cm.toFixed(1):'--';b.className='badge'+(d.ok?'':' off');b.querySelector('b').textContent=d.ok?(d.sim?'Sim':'Live'):'No data'}
+function render(d){
+  lastT=d.train;
+  $('#piName').textContent=d.sim?'Simulation mode':'Raspberry Pi 4';
+  setSensor('lidar',d.lidar);setSensor('ultra',d.ultra);
+  $('#modelMsg').textContent='Camera AI - '+d.model.text;
+  const o=d.obstacle,box=$('#alert'),cls={clear:'clear',identifying:'warn',stopped:'danger'}[o.state];
+  box.className='card alert '+cls;
+  $('#aTitle').textContent={clear:'TRACK CLEAR \u2014 NO OBSTACLE',identifying:'OBSTACLE FOUND \u2014 TRAIN STOPPED, IDENTIFYING...',stopped:'OBSTACLE \u2014 TRAIN STOPPED'}[o.state];
+  $('#aObj').textContent=o.state==='clear'?'None':(o.state==='identifying'?'Identifying...':(o.label?o.label+(o.conf?' ('+Math.round(o.conf*100)+'%)':''):'Unknown object'));
+  $('#aDist').textContent=(o.distance==null?'--':o.distance.toFixed(1))+' cm';
+  $('#aNote').textContent=o.state==='clear'?'Stops at '+d.cfg.stop_cm+' cm (LiDAR'+(d.cfg.use_ultra?' + ultrasonic':'')+') \u00b7 camera: '+d.pi.camera+(d.pi.temp?' \u00b7 CPU '+d.pi.temp+'\u00b0C':''):('Stopped by: '+(o.source||'?')+(o.state==='stopped'&&!o.label?' \u00b7 camera could not name it (add more dataset images / install YOLO)':''));
+  if(o.snap_id!==snapId&&o.snap_id>0){snapId=o.snap_id;$('#aImg').src='/obstacle.jpg?'+snapId}
+  const t=d.train;
+  $('#curSpeed').textContent=t.cur+' / '+d.cfg.speed_max;
+  if(!sliderBusy&&(firstSync||!document.activeElement||document.activeElement.id!=='speed')){$('#speed').value=t.target;firstSync=false}
+  $('#tgt').textContent=t.target;
+  const b=$('#trainBtn');
+  if(t.running){b.className='tbtn '+(t.ramping?'ramp':'');b.innerHTML=t.ramping?'&#9654; Accelerating (tap to stop)':'&#9654; Running \u2014 constant speed (tap to stop)'}
+  else if(t.braked){b.className='tbtn brk';b.innerHTML='&#9632; '+esc(t.reason||'Stopped')+' (tap to restart)'}
+  else{b.className='tbtn idle';b.innerHTML='&#9654; Start Train'}
+  if(t.reason&&!t.running)$('#trainMsg').textContent=t.reason;
+}
+function connect(){
+  const es=new EventSource('/stream'),c=$('#conn');
+  es.onopen=()=>{c.className='conn';$('#connTxt').textContent='Connected'};
+  es.onerror=()=>{c.className='conn off';$('#connTxt').textContent='Disconnected'};
+  es.onmessage=e=>render(JSON.parse(e.data));
+}
+connect();
+$('#video').onerror=function(){setTimeout(()=>{this.src='/video_feed?'+Date.now()},2000)};
+
+/* ---------- train ---------- */
+$('#trainBtn').onclick=async()=>{
+  if(lastT&&lastT.running){await J('/api/train/stop');return}
+  const r=await J('/api/train/start',{speed:+$('#speed').value});
+  $('#trainMsg').textContent=r.ok?'Starting, then speeding up to the target...':(r.msg||'Could not start');
+};
+$('#speed').oninput=()=>{sliderBusy=true;clearTimeout($('#speed').t);$('#speed').t=setTimeout(async()=>{await J('/api/train/speed',{speed:+$('#speed').value});sliderBusy=false},120)};
+
+/* ---------- camera dataset ---------- */
+async function loadDatasets(sel){
+  const l=await (await fetch('/api/datasets')).json(),s=$('#saveTo'),keep=sel||s.value;
+  s.innerHTML=l.map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join('')+'<option value="__new__">+ New folder...</option>';
+  if(l.includes(keep))s.value=keep;
+}
+$('#saveTo').onchange=async()=>{
+  if($('#saveTo').value!=='__new__')return;
+  const n=(prompt('New dataset folder name (this becomes the object label, e.g. cow, buffalo, giraffe):')||'').trim().replace(/[^A-Za-z0-9_-]/g,'_');
+  if(n){await J('/api/create',{path:'dataset/'+n,type:'dir'});await loadDatasets(n);loadTree()}else loadDatasets();
+};
+$('#capBtn').onclick=async()=>{
+  const f=$('#saveTo').value;if(!f||f==='__new__'){toast('Choose a folder first');return}
+  $('#capMsg').textContent='Saving and analysing...';
+  const r=await J('/api/capture',{folder:f});
+  $('#capMsg').textContent=r.ok?'Saved '+r.file.split('/').pop()+' ('+r.count+' images in '+f+') \u00b7 camera sees: '+r.sees:(r.error||'Failed');
+  if(r.ok){toast('Saved to dataset/'+f);loadTree()}
+};
+$('#trainModelBtn').onclick=async()=>{const r=await J('/api/model/train');toast(r.ok?'Training started - watch the status line':(r.error||'Failed'))};
+
+/* ---------- file tree ---------- */
+const FOLDER='<svg width="22" height="22" viewBox="0 0 24 24" fill="#f6b73c"><path d="M2 5a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/></svg>';
+const FILE='<svg width="20" height="20" viewBox="0 0 24 24" fill="#8fb4ff"><path d="M6 2h8l6 6v14H6zM14 3v6h6"/></svg>';
+const open=new Set(['dataset']);let selDir='code';
+function build(nodes){
+  const ul=document.createElement('ul');
+  nodes.forEach(n=>{
+    const li=document.createElement('li'),row=document.createElement('div');row.className='trow';
+    if(n.type==='dir'){
+      const o=open.has(n.path);row.className+=n.path===selDir?' sel':'';
+      row.innerHTML=`<span class="car">${o?'\u25BE':'\u25B8'}</span>${FOLDER}<span>${esc(n.name)}/</span>`;
+      row.onclick=()=>{selDir=n.path;o?open.delete(n.path):open.add(n.path);loadTree()};
+      li.appendChild(row);if(o)li.appendChild(build(n.children));
+    }else if(n.type==='file'){
+      row.innerHTML=`<span class="car"></span>${FILE}<span>${esc(n.name)}</span>`;
+      row.onclick=()=>/\.(jpe?g|png|gif|bmp|webp)$/i.test(n.name)?window.open('/api/raw?path='+encodeURIComponent(n.path)):openFile(n.path);
+      li.appendChild(row);
+    }else{row.className+=' more';row.textContent=n.name;li.appendChild(row)}
+    ul.appendChild(li);
+  });return ul;
+}
+async function loadTree(){
+  try{const j=await (await fetch('/api/tree')).json(),t=$('#tree'),sc=t.scrollTop;t.innerHTML='';t.appendChild(build(j.children));t.scrollTop=sc}catch(e){}
+}
+$('#refresh').onclick=loadTree;
+$('#newFile').onclick=async()=>{const n=prompt('New file name (inside '+selDir+'/):','new_script.py');if(!n)return;const p=selDir+'/'+n;const r=await J('/api/create',{path:p,type:'file'});r.error?toast(r.error):(await loadTree(),openFile(p))};
+$('#newDir').onclick=async()=>{const n=prompt('New folder name (inside '+selDir+'/):');if(!n)return;const r=await J('/api/create',{path:selDir+'/'+n,type:'dir'});r.error?toast(r.error):(open.add(selDir),loadTree(),loadDatasets())};
+
+/* ---------- editor ---------- */
+let cur=null;const ta=$('#ta'),hl=$('#hl'),gut=$('#gut');
+function highlight(src){
+  const re=/(#.*$)|("{3}[\s\S]*?"{3}|'{3}[\s\S]*?'{3}|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|\b(def|class|if|elif|else|while|for|in|return|import|from|as|try|except|finally|with|pass|break|continue|and|or|not|is|lambda|global|raise|yield|True|False|None)\b|\b(\d+\.?\d*)\b|\b([A-Za-z_]\w*)(?=\()/gm;
+  let out='',last=0,m;
+  while((m=re.exec(src))){
+    out+=esc(src.slice(last,m.index));
+    const c=m[1]?'c':m[2]?'s':m[3]?'k':m[4]?'n':'f';
+    out+=`<span class="${c}">${esc(m[0])}</span>`;last=re.lastIndex;
+    if(m[0].length===0)re.lastIndex++;
+  }
+  return out+esc(src.slice(last))+'\n';
+}
+function upd(){hl.innerHTML=highlight(ta.value);const n=ta.value.split('\n').length;gut.textContent=Array.from({length:n},(_,i)=>i+1).join('\n');sync()}
+function sync(){hl.scrollTop=ta.scrollTop;hl.scrollLeft=ta.scrollLeft;gut.scrollTop=ta.scrollTop}
+ta.addEventListener('input',upd);ta.addEventListener('scroll',sync);
+ta.addEventListener('keydown',e=>{
+  if(e.key==='Tab'){e.preventDefault();const s=ta.selectionStart;ta.setRangeText('    ',s,ta.selectionEnd,'end');upd()}
+  if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();save()}
+  if(e.key==='F5'){e.preventDefault();run(false)}
+});
+async function openFile(p){
+  const r=await (await fetch('/api/file?path='+encodeURIComponent(p))).json();
+  if(r.error){toast(r.error);return}
+  ta.value=r.content;cur=p;$('#fname').textContent=p;upd();tab('editor');
+}
+async function save(){if(!cur){toast('Open or create a file first');return false}const r=await J('/api/file',{path:cur,content:ta.value});toast(r.ok?'Saved '+cur:(r.error||'Save failed'));return !!r.ok}
+async function run(dbg){if(!(await save()))return;const r=await J('/api/run',{path:cur,debug:dbg});if(r.error)toast(r.error)}
+$('#bSave').onclick=save;$('#bRun').onclick=()=>run(false);$('#bDbg').onclick=()=>run(true);$('#bStop').onclick=()=>J('/api/run/stop');
+$('#shellIn').onkeydown=e=>{if(e.key==='Enter'){const v=e.target.value;e.target.value='';$('#shell').textContent+='> '+v+'\n';J('/api/run/input',{text:v})}};
+upd();
+
+/* ---------- tabs / terminal ---------- */
+let curTab='editor';
+function tab(n){['editor','terminal'].forEach(x=>{$('#tab-'+x).classList.toggle('on',x===n);$('#pane-'+x).style.display=x===n?'flex':'none'});curTab=n;if(n==='terminal')setTimeout(()=>$('#termIn').focus(),50)}
+$('#tab-editor').onclick=()=>tab('editor');$('#tab-terminal').onclick=()=>tab('terminal');
+const st={run:{pos:0},term:{pos:0}};
+async function pollBuf(url,s,el){
+  try{const j=await (await fetch(url+'?since='+s.pos)).json();
+    if(j.text){const stick=el.scrollTop+el.clientHeight>=el.scrollHeight-30;el.textContent+=j.text;if(el.textContent.length>120000)el.textContent=el.textContent.slice(-80000);if(stick)el.scrollTop=el.scrollHeight}
+    s.pos=j.next;return j}catch(e){}
+}
+setInterval(async()=>{const j=await pollBuf('/api/run/output',st.run,$('#shell'));if(j){$('#bStop').disabled=!j.running}},500);
+setInterval(()=>{if(curTab==='terminal')pollBuf('/api/term/output',st.term,$('#termOut'))},350);
+const hist=[];let hi=0;
+$('#termIn').onkeydown=e=>{
+  if(e.key==='Enter'){const v=e.target.value;if(v)hist.push(v);hi=hist.length;e.target.value='';J('/api/term/input',{data:v+'\n'})}
+  else if(e.key==='ArrowUp'){if(hi>0)e.target.value=hist[--hi]||'';e.preventDefault()}
+  else if(e.key==='ArrowDown'){e.target.value=hist[++hi]||'';e.preventDefault()}
+  else if(e.ctrlKey&&e.key==='c'&&!window.getSelection().toString()){J('/api/term/input',{data:'\x03'});e.preventDefault()}
+};
+$('#tInt').onclick=()=>J('/api/term/input',{data:'\x03'});
+$('#tClr').onclick=()=>{$('#termOut').textContent=''};
+
+/* ---------- sidebar ---------- */
+$$('#nav a').forEach(a=>a.onclick=()=>{
+  $$('#nav a').forEach(x=>x.classList.remove('on'));a.classList.add('on');
+  if(a.dataset.tab)tab(a.dataset.tab);
+  const t=$('#'+a.dataset.go);t.scrollIntoView({behavior:'smooth',block:'start'});
+  if(a.dataset.go!=='top'){t.classList.add('flash');setTimeout(()=>t.classList.remove('flash'),900)}
+});
+
+/* ---------- shutdown (password protected) ---------- */
+function openShut(){$('#shPass').value='';$('#shErr').textContent='';$('#modal').classList.add('on');setTimeout(()=>$('#shPass').focus(),50)}
+async function doShut(){
+  const yes=$('#mYes');yes.disabled=true;yes.textContent='Shutting down...';
+  const r=await J('/api/shutdown',{password:$('#shPass').value});
+  yes.disabled=false;yes.textContent='Shut down';
+  if(r.ok){
+    document.body.innerHTML='<div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;background:#0a101c;color:#e9efff;font-family:sans-serif;text-align:center;padding:20px"><h1>Raspberry Pi is shutting down</h1><p style="color:#9db0d3;font-size:18px">Wait about 15-20 seconds until the green LED stops blinking and stays off.<br>Then switch off the battery.</p></div>';
+  }else{$('#shErr').textContent=r.error||'Shutdown failed';$('#shPass').select()}
+}
+$('#btnShut').onclick=openShut;
+$('#mNo').onclick=()=>$('#modal').classList.remove('on');
+$('#mYes').onclick=doShut;
+$('#shPass').onkeydown=e=>{if(e.key==='Enter')doShut();if(e.key==='Escape')$('#modal').classList.remove('on')};
+
+/* ---------- obstacle check (camera only) ---------- */
+function showCheck(r){
+  $('#chkR').className='chkR '+r.level;$('#chkV').textContent=r.verdict;
+  $('#chkG').innerHTML=`<div>Object<b style="font-size:22px">${esc(r.label||'None')}</b></div><div>Confidence<b>${r.conf?Math.round(r.conf*100)+'%':'--'}</b></div><div>Source<b style="font-size:22px">${esc(r.source||'--')}</b></div><div>Camera<b style="font-size:20px">${esc(r.camera)}</b></div>`;
+  if(r.snap_id){$('#chkT').style.display='block';$('#chkImg').src='/check.jpg?'+r.snap_id}
+}
+async function loadChkHist(){try{const h=await (await fetch('/api/check')).json();$('#chkH').innerHTML=h.slice().reverse().map(x=>`<div>${esc(x.time)} \u2014 ${esc(x.verdict)}</div>`).join('')}catch(e){}}
+$('#chkBtn').onclick=async()=>{
+  const b=$('#chkBtn');b.disabled=true;b.textContent='Checking...';$('#chkV').textContent='Analysing camera image...';
+  try{showCheck(await J('/api/check'));loadChkHist()}catch(e){toast('Check failed')}
+  b.disabled=false;b.textContent='Run Obstacle Check';
+};
+
+loadDatasets();loadTree();loadChkHist();setInterval(loadTree,6000);
+</script></body></html>
+"""
+
+if __name__ == "__main__":
+    start_sensors()
+    threading.Thread(target=monitor, daemon=True).start()
+    print("Project folder :", ROOT)
+    print("Dashboard      : http://<raspberry-pi-ip>:%d   (login %s)" % (PORT, AUTH_USER if AUTH_PASS else "disabled"))
+    app.run(host=HOST, port=PORT, threaded=True, debug=False)
