@@ -69,7 +69,7 @@ except Exception:
 # ============================ SETTINGS (edit here) ============================
 HOST, PORT = "0.0.0.0", 5000
 AUTH_USER, AUTH_PASS = "admin", "railway123"      # dashboard login. Set AUTH_PASS = None to disable
-SHUTDOWN_PASS = "1234"                            # password asked by the Shutdown button
+SHUTDOWN_PASS = "1234"                            # password asked by the Shutdown button (a file ~/RailwayProject/shutdown_password.txt overrides it)
 ROOT = os.path.expanduser("~/RailwayProject")     # project folder (created automatically)
 
 SLOW_CM = 25.0              # obstacle found at this distance (LiDAR or ultrasonic): slow down and stop smoothly
@@ -1338,30 +1338,50 @@ def check_jpg():
     return Response(CHECK["snap"], mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
-def _poweroff_now():
-    time.sleep(0.3)                      # lets the HTTP reply reach the browser first
-    for cmd in (["shutdown", "-h", "now"] if os.geteuid() == 0 else ["sudo", "-n", "shutdown", "-h", "now"],
-                ["sudo", "-n", "systemctl", "poweroff"],
-                ["sudo", "-n", "poweroff"]):
+def current_shutdown_pass():
+    """Shutdown password. If ROOT/shutdown_password.txt exists, its first line is used (no restart needed)."""
+    try:
+        with open(os.path.join(ROOT, "shutdown_password.txt")) as f:
+            v = f.readline().strip()
+            if v:
+                return v
+    except OSError:
+        pass
+    return SHUTDOWN_PASS
+
+
+def _try_poweroff():
+    """Runs the power-off command and returns (True, '') if it was accepted, else (False, real reason)."""
+    if os.geteuid() == 0:
+        cmds = [["systemctl", "poweroff"], ["shutdown", "-h", "now"], ["poweroff"]]
+    else:
+        cmds = [["sudo", "-n", "systemctl", "poweroff"], ["sudo", "-n", "shutdown", "-h", "now"], ["sudo", "-n", "poweroff"]]
+    last = "no command worked"
+    for c in cmds:
         try:
-            if subprocess.call(cmd) == 0:
-                return
-        except Exception:
-            pass
+            r = subprocess.run(c, capture_output=True, text=True, timeout=8)
+            if r.returncode == 0:
+                return True, ""
+            last = ((r.stderr or r.stdout or "").strip() or "exit code %d" % r.returncode)[:160]
+        except FileNotFoundError:
+            last = "%s not found" % c[0]
+        except Exception as e:
+            last = str(e)[:160]
+    return False, last
 
 
 @app.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
-    pw = str((request.json or {}).get("password", ""))
-    if not hmac.compare_digest(pw.encode(), SHUTDOWN_PASS.encode()):
-        return jsonify(ok=False, error="Wrong password"), 403
+    pw = str((request.json or {}).get("password", "")).strip()
+    if not hmac.compare_digest(pw.encode(), current_shutdown_pass().encode()):
+        return jsonify(ok=False, error="Wrong shutdown password"), 403
     if os.name != "posix":
-        return jsonify(ok=False, error="Shutdown only works on the Raspberry Pi")
-    if os.geteuid() != 0 and subprocess.call(["sudo", "-n", "true"], stderr=subprocess.DEVNULL) != 0:
-        return jsonify(ok=False, error="No permission: add a NOPASSWD sudo rule for shutdown")
+        return jsonify(ok=False, error="Shutdown only works on the Raspberry Pi"), 400
     train.stop("Shutdown")               # motor off first
+    ok, why = _try_poweroff()
+    if not ok:
+        return jsonify(ok=False, error="Password OK but the shutdown command failed: %s" % why), 500
     LCD_OVERRIDE[0] = ("SHUTTING DOWN", "Then power off")
-    threading.Thread(target=_poweroff_now, daemon=True).start()
     return jsonify(ok=True)
 
 
@@ -1771,8 +1791,12 @@ $$('#nav a').forEach(a=>a.onclick=()=>{
 /* ---------- shutdown (password protected) ---------- */
 function openShut(){$('#shPass').value='';$('#shErr').textContent='';$('#modal').classList.add('on');setTimeout(()=>$('#shPass').focus(),50)}
 async function doShut(){
-  const yes=$('#mYes');yes.disabled=true;yes.textContent='Shutting down...';
-  const r=await J('/api/shutdown',{password:$('#shPass').value});
+  const yes=$('#mYes');yes.disabled=true;yes.textContent='Shutting down...';$('#shErr').textContent='';
+  let r={};
+  try{
+    const resp=await fetch('/api/shutdown',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:$('#shPass').value})});
+    r=await resp.json().catch(()=>({error:'Server answered '+resp.status+(resp.status===401?' - dashboard login expired, reload the page':'')}));
+  }catch(e){r={error:'Lost connection to the Pi - it may already be shutting down. Watch the green LED.'}}
   yes.disabled=false;yes.textContent='Shut down';
   if(r.ok){
     document.body.innerHTML='<div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;background:#0a101c;color:#e9efff;font-family:sans-serif;text-align:center;padding:20px"><h1>Raspberry Pi is shutting down</h1><p style="color:#9db0d3;font-size:18px">Wait about 15-20 seconds until the green LED stops blinking and stays off.<br>Then switch off the battery.</p></div>';
